@@ -624,6 +624,7 @@
     let currentFilter = '';
     let detailToken = 0; // prevents race when navigating related → related
     let entryByPath = new Map(); // path → entry, for reliable related navigation
+    let feedScrollY = 0; // restore scroll when going back from detail
 
     const feedEl = document.getElementById('feed');
     const loadingEl = document.getElementById('loading');
@@ -850,6 +851,11 @@
     async function openDetail(entry) {
       const myToken = ++detailToken; // invalidate any previous in-flight detail load
 
+      // Save feed scroll only when leaving the feed (not related→related)
+      if (!detailView.classList.contains('active')) {
+        feedScrollY = window.scrollY || window.pageYOffset || 0;
+      }
+
       feedView.classList.add('hidden');
       detailView.classList.add('active');
       window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -1005,20 +1011,28 @@
       }
     }
 
-    function closeDetail() {
+    function closeDetail(restoreScroll = true) {
       detailView.classList.remove('active');
       feedView.classList.remove('hidden');
+      if (restoreScroll) {
+        // restore after layout paints
+        requestAnimationFrame(() => {
+          window.scrollTo({ top: feedScrollY, behavior: 'auto' });
+        });
+      }
     }
 
     // Events
     loadMoreBtn.addEventListener('click', () => showMore(false));
-    backBtn.addEventListener('click', closeDetail);
+    backBtn.addEventListener('click', () => closeDetail(true));
     homeLink.addEventListener('click', (e) => {
       e.preventDefault();
-      closeDetail();
+      closeDetail(false);
       searchEl.value = '';
       currentFilter = '';
+      feedScrollY = 0;
       showMore(true);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
     });
 
     let searchTimeout;
@@ -1026,7 +1040,13 @@
       clearTimeout(searchTimeout);
       searchTimeout = setTimeout(() => {
         currentFilter = searchEl.value.trim();
+        // If currently on a detail page, return to feed first so search is visible
+        if (detailView.classList.contains('active')) {
+          closeDetail(false);
+          feedScrollY = 0;
+        }
         showMore(true);
+        window.scrollTo({ top: 0, behavior: 'smooth' });
       }, 200);
     });
 

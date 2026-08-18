@@ -627,6 +627,59 @@
     let entryByPath = new Map(); // path → entry, for reliable related navigation
     let feedScrollY = 0; // restore scroll when going back from detail
     let currentDetailEntry = null; // currently open detail entry
+    let ignoreHashChange = false;
+
+    function entryHash(entry) {
+      const path = normalizePath(entry.postUrl || entry.id || '');
+      // always produce #/p/repo_posts/...
+      const clean = path.startsWith('/') ? path : '/' + path;
+      return '#/p' + clean;
+    }
+
+    function parseHash() {
+      const h = location.hash || '';
+      // expected: #/p/repo_posts/2026/...
+      if (h.startsWith('#/p/')) {
+        return h.slice(3); // → /repo_posts/...
+      }
+      return null;
+    }
+
+    function navigateToFeed(replace = false) {
+      ignoreHashChange = true;
+      const base = location.pathname + location.search;
+      try {
+        if (replace) {
+          history.replaceState({ view: 'feed' }, '', base);
+        } else {
+          history.pushState({ view: 'feed' }, '', base);
+        }
+      } catch (e) {
+        // file:// fallback
+        location.hash = '';
+      }
+      // clear hash without triggering handler
+      if (location.hash) {
+        history.replaceState({ view: 'feed' }, '', base);
+      }
+      setTimeout(() => { ignoreHashChange = false; }, 0);
+    }
+
+    function navigateToDetail(entry, replace = false) {
+      ignoreHashChange = true;
+      const hash = entryHash(entry);
+      try {
+        if (replace) {
+          history.replaceState({ view: 'detail', id: entry.id || entry.postUrl }, '', hash);
+        } else {
+          history.pushState({ view: 'detail', id: entry.id || entry.postUrl }, '', hash);
+        }
+      } catch (e) {
+        // file:// fallback – hash navigation still creates history entries on most mobile browsers
+        location.hash = hash;
+      }
+      setTimeout(() => { ignoreHashChange = false; }, 0);
+    }
 
     const feedEl = document.getElementById('feed');
     const loadingEl = document.getElementById('loading');
@@ -845,18 +898,32 @@
         entryCountEl.textContent = `${allEntries.length.toLocaleString()} entries`;
         loadingEl.style.display = 'none';
         showMore(true);
+
+        // Deep-link: open detail if URL has #/p/...
+        const initialPath = parseHash();
+        if (initialPath) {
+          const entry = findEntryByUrl(initialPath) || findEntryByUrl(BASE + initialPath);
+          if (entry) openDetail(entry, { replace: true, skipHistory: false });
+        } else {
+          history.replaceState({ view: 'feed' }, '', location.pathname + location.search);
+        }
       } catch (err) {
         loadingEl.innerHTML = `<div class="error">FEED ERROR: ${escapeHtml(err.message)}</div>`;
       }
     }
 
-    async function openDetail(entry) {
+    async function openDetail(entry, opts = {}) {
+      const { replace = false, skipHistory = false } = opts;
       const myToken = ++detailToken; // invalidate any previous in-flight detail load
       currentDetailEntry = entry;
 
       // Save feed scroll only when leaving the feed (not related→related)
       if (!detailView.classList.contains('active')) {
         feedScrollY = window.scrollY || window.pageYOffset || 0;
+      }
+
+      if (!skipHistory) {
+        navigateToDetail(entry, replace);
       }
 
       feedView.classList.add('hidden');
@@ -1018,27 +1085,68 @@
       }
     }
 
-    function closeDetail(restoreScroll = true) {
+    function showFeedView(restoreScroll = true) {
       detailView.classList.remove('active');
       feedView.classList.remove('hidden');
       currentDetailEntry = null;
       if (restoreScroll) {
-        // restore after layout paints
         requestAnimationFrame(() => {
           window.scrollTo({ top: feedScrollY, behavior: 'auto' });
         });
       }
     }
 
+    function closeDetail(restoreScroll = true) {
+      // Use browser history so phone Back button and UI Back stay in sync
+      if (location.hash && location.hash.startsWith('#/p')) {
+        const before = location.hash;
+        history.back();
+        // If nothing changed (no history entry to go back to), force feed
+        setTimeout(() => {
+          if (location.hash === before && detailView.classList.contains('active')) {
+            navigateToFeed(true);
+            showFeedView(restoreScroll);
+          }
+        }, 80);
+        return;
+      }
+      navigateToFeed(true);
+      showFeedView(restoreScroll);
+    }
+
+    // Browser / phone Back & Forward (popstate + hashchange for file://)
+    function handleHistoryNav() {
+      if (ignoreHashChange) return;
+      const path = parseHash();
+      if (path) {
+        const entry = findEntryByUrl(path) || findEntryByUrl(BASE + path);
+        if (entry) {
+          // only open if different from current
+          if (!currentDetailEntry || normalizePath(currentDetailEntry.postUrl) !== normalizePath(entry.postUrl)) {
+            openDetail(entry, { skipHistory: true });
+          }
+          return;
+        }
+      }
+      // no detail hash → show feed
+      if (detailView.classList.contains('active')) {
+        showFeedView(true);
+      }
+    }
+    window.addEventListener('popstate', handleHistoryNav);
+    window.addEventListener('hashchange', handleHistoryNav);
+
     // Events
     loadMoreBtn.addEventListener('click', () => showMore(false));
     backBtn.addEventListener('click', () => closeDetail(true));
     homeLink.addEventListener('click', (e) => {
       e.preventDefault();
-      closeDetail(false);
       searchEl.value = '';
       currentFilter = '';
       feedScrollY = 0;
+      detailBeforeSearch = null;
+      navigateToFeed(true);
+      showFeedView(false);
       showMore(true);
       window.scrollTo({ top: 0, behavior: 'smooth' });
     });
@@ -1066,7 +1174,9 @@
         currentFilter = q;
 
         if (wasOnDetail) {
-          closeDetail(false);
+          // leave detail without history.back() – search is a temporary overlay on feed
+          navigateToFeed(true);
+          showFeedView(false);
         }
 
         showMore(true);
@@ -1076,7 +1186,7 @@
           if (detailBeforeSearch) {
             const entry = detailBeforeSearch;
             detailBeforeSearch = null;
-            openDetail(entry);
+            openDetail(entry); // pushes detail into history again
           } else {
             requestAnimationFrame(() => {
               window.scrollTo({ top: scrollBeforeSearch || feedScrollY || 0, behavior: 'auto' });

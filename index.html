@@ -622,6 +622,8 @@
     let allEntries = [];
     let visibleCount = 0;
     let currentFilter = '';
+    let detailToken = 0; // prevents race when navigating related → related
+    let entryByPath = new Map(); // path → entry, for reliable related navigation
 
     const feedEl = document.getElementById('feed');
     const loadingEl = document.getElementById('loading');
@@ -632,6 +634,48 @@
     const detailView = document.getElementById('detail-view');
     const backBtn = document.getElementById('back-btn');
     const homeLink = document.getElementById('home-link');
+    const relatedGridEl = document.getElementById('related-grid');
+
+    function normalizePath(url) {
+      try {
+        let p = url.startsWith('http') ? new URL(url).pathname : url;
+        p = p.replace(/\/+$/, '');
+        if (!p.startsWith('/')) p = '/' + p;
+        return p;
+      } catch {
+        return url;
+      }
+    }
+
+    function findEntryByUrl(url) {
+      if (!url) return null;
+      const path = normalizePath(url);
+      if (entryByPath.has(path)) return entryByPath.get(path);
+      // try with/without leading /repo_posts
+      for (const [k, v] of entryByPath) {
+        if (path.endsWith(k) || k.endsWith(path) || path.includes(k.split('/').pop())) return v;
+      }
+      return allEntries.find(e => {
+        const ep = normalizePath(e.postUrl || e.id || '');
+        return ep === path || path.endsWith(ep) || ep.endsWith(path);
+      }) || null;
+    }
+
+    // Event delegation: related clicks always work, even after re-renders
+    relatedGridEl.addEventListener('click', (ev) => {
+      if (ev.target.closest('a')) return; // GitHub / archive links open normally
+      const item = ev.target.closest('.related-item');
+      if (!item) return;
+      const href = item.dataset.href;
+      if (!href) return;
+      const found = findEntryByUrl(href);
+      if (found) {
+        ev.preventDefault();
+        openDetail(found);
+      } else {
+        window.open(href, '_blank');
+      }
+    });
 
     const ghIcon = `<svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>`;
 
@@ -787,6 +831,14 @@
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const text = await res.text();
         allEntries = parseFeed(text);
+        entryByPath = new Map();
+        allEntries.forEach(e => {
+          const p = normalizePath(e.postUrl || e.id || '');
+          if (p) entryByPath.set(p, e);
+          // also store just the filename key
+          const file = p.split('/').pop();
+          if (file) entryByPath.set(file, e);
+        });
         entryCountEl.textContent = `${allEntries.length.toLocaleString()} entries`;
         loadingEl.style.display = 'none';
         showMore(true);
@@ -796,6 +848,8 @@
     }
 
     async function openDetail(entry) {
+      const myToken = ++detailToken; // invalidate any previous in-flight detail load
+
       feedView.classList.add('hidden');
       detailView.classList.add('active');
       window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -823,11 +877,15 @@
 
       try {
         const res = await fetch(entry.postUrl);
+        if (myToken !== detailToken) return; // stale – user already navigated elsewhere
         const html = await res.text();
+        if (myToken !== detailToken) return;
+
         const parser = new DOMParser();
         const doc = parser.parseFromString(html, 'text/html');
 
         const relatedCards = doc.querySelectorAll('li.related-card, .related-list li, ul.related-list > li');
+        if (myToken !== detailToken) return;
         relatedGrid.innerHTML = '';
 
         function renderRelatedItem({ href, snippet, imgSrc, title, github }) {
@@ -835,15 +893,17 @@
           const displayTitle = title || snippet.slice(0, 60) || 'Related repository';
           const item = document.createElement('li');
           item.className = 'related-item';
+          item.style.cursor = 'pointer';
+          item.dataset.href = href || '';
           item.innerHTML = `
             ${imgSrc ? `<img class="related-preview" src="${imgSrc}" alt="" loading="lazy" onerror="this.style.display='none'">` : ''}
             <div class="related-body">
-              <a class="related-main" href="${href}" target="_blank" rel="noopener">
+              <div class="related-main">
                 <div class="related-title">${escapeHtml(displayTitle)}</div>
                 <div class="related-snippet">${escapeHtml(snippet || '')}</div>
-              </a>
+              </div>
               <div class="related-meta">
-                ${github ? `<a class="gh-link" href="${github}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${ghIcon}${escapeHtml(shortGh || 'GitHub')}</a>` : ''}
+                ${github ? `<a class="gh-link" href="${github}" target="_blank" rel="noopener">${ghIcon}${escapeHtml(shortGh || 'GitHub')}</a>` : ''}
                 <a href="${href}" target="_blank" rel="noopener">View in archive ↗</a>
               </div>
             </div>
@@ -927,29 +987,20 @@
           }
         }
       } catch (err) {
+        if (myToken !== detailToken) return; // stale
         // Even on fetch error, try feed-based fallback
         relatedGrid.innerHTML = '';
         allEntries
           .filter(e => e.id !== entry.id)
           .slice(0, 6)
           .forEach(e => {
-            const item = document.createElement('li');
-            item.className = 'related-item';
-            const shortGh = e.github ? repoNameFromGithub(e.github) : '';
-            item.innerHTML = `
-              ${e.image ? `<img class="related-preview" src="${e.image}" alt="" loading="lazy" onerror="this.style.display='none'">` : ''}
-              <div class="related-body">
-                <a class="related-main" href="${e.postUrl}" target="_blank" rel="noopener">
-                  <div class="related-title">${escapeHtml(e.title)}</div>
-                  <div class="related-snippet">${escapeHtml(e.description || '')}</div>
-                </a>
-                <div class="related-meta">
-                  ${e.github ? `<a class="gh-link" href="${e.github}" target="_blank" rel="noopener">${ghIcon}${escapeHtml(shortGh || 'GitHub')}</a>` : ''}
-                  <a href="${e.postUrl}" target="_blank" rel="noopener">View in archive ↗</a>
-                </div>
-              </div>
-            `;
-            relatedGrid.appendChild(item);
+            renderRelatedItem({
+              href: e.postUrl,
+              snippet: e.description || '',
+              imgSrc: e.image || '',
+              title: e.title,
+              github: e.github || ''
+            });
           });
       }
     }
@@ -984,4 +1035,3 @@
   </script>
 </body>
 </html>
-Tom Doerr GitHub Feed HTML Archive - Grok

@@ -481,8 +481,9 @@
       color: var(--eva-text-dim);
       display: flex;
       flex-wrap: wrap;
-      gap: 10px;
+      gap: 12px;
       align-items: center;
+      margin-top: 4px;
     }
     .related-item .related-meta a {
       color: var(--eva-text-dim);
@@ -625,6 +626,7 @@
     let detailToken = 0; // prevents race when navigating related → related
     let entryByPath = new Map(); // path → entry, for reliable related navigation
     let feedScrollY = 0; // restore scroll when going back from detail
+    let currentDetailEntry = null; // currently open detail entry
 
     const feedEl = document.getElementById('feed');
     const loadingEl = document.getElementById('loading');
@@ -850,6 +852,7 @@
 
     async function openDetail(entry) {
       const myToken = ++detailToken; // invalidate any previous in-flight detail load
+      currentDetailEntry = entry;
 
       // Save feed scroll only when leaving the feed (not related→related)
       if (!detailView.classList.contains('active')) {
@@ -890,17 +893,26 @@
         const parser = new DOMParser();
         const doc = parser.parseFromString(html, 'text/html');
 
-        const relatedCards = doc.querySelectorAll('li.related-card, .related-list li, ul.related-list > li');
+        const relatedCards = doc.querySelectorAll('ul.related-list > li');
         if (myToken !== detailToken) return;
         relatedGrid.innerHTML = '';
 
+        const seenHrefs = new Set();
+
         function renderRelatedItem({ href, snippet, imgSrc, title, github }) {
+          if (!href) return;
+          const key = normalizePath(href);
+          if (seenHrefs.has(key)) return; // skip duplicates
+          // skip the current entry itself
+          if (entry && (normalizePath(entry.postUrl) === key || normalizePath(entry.id || '') === key)) return;
+          seenHrefs.add(key);
+
           const shortGh = github ? repoNameFromGithub(github) : '';
           const displayTitle = title || snippet.slice(0, 60) || 'Related repository';
           const item = document.createElement('li');
           item.className = 'related-item';
           item.style.cursor = 'pointer';
-          item.dataset.href = href || '';
+          item.dataset.href = href;
           item.innerHTML = `
             ${imgSrc ? `<img class="related-preview" src="${imgSrc}" alt="" loading="lazy" onerror="this.style.display='none'">` : ''}
             <div class="related-body">
@@ -909,7 +921,7 @@
                 <div class="related-snippet">${escapeHtml(snippet || '')}</div>
               </div>
               <div class="related-meta">
-                ${github ? `<a class="gh-link" href="${github}" target="_blank" rel="noopener">${ghIcon}${escapeHtml(shortGh || 'GitHub')}</a>` : ''}
+                ${github ? `<a class="gh-link" href="${github}" target="_blank" rel="noopener">${ghIcon} ${escapeHtml(shortGh || 'GitHub')}</a>` : ''}
                 <a href="${href}" target="_blank" rel="noopener">View in archive ↗</a>
               </div>
             </div>
@@ -921,7 +933,7 @@
           relatedCards.forEach(li => {
             const link = li.querySelector('a.related-link, a[href*="/repo_posts/"]');
             const img = li.querySelector('img');
-            const snippet = (li.querySelector('.related-snippet')?.textContent || link?.textContent || '').trim();
+            const snippet = (li.querySelector('.related-snippet')?.textContent || '').trim();
             if (!link) return;
 
             let href = link.getAttribute('href') || '';
@@ -930,12 +942,7 @@
             let imgSrc = img ? (img.getAttribute('src') || '') : '';
             if (imgSrc && imgSrc.startsWith('/')) imgSrc = BASE + imgSrc;
 
-            const matched = allEntries.find(e =>
-              e.postUrl === href ||
-              e.postUrl.endsWith(href.replace(BASE, '')) ||
-              href.endsWith(e.id?.replace(BASE, '') || '') ||
-              (e.postUrl && href.includes(e.postUrl.split('/').pop()))
-            );
+            const matched = findEntryByUrl(href);
 
             renderRelatedItem({
               href,
@@ -1014,6 +1021,7 @@
     function closeDetail(restoreScroll = true) {
       detailView.classList.remove('active');
       feedView.classList.remove('hidden');
+      currentDetailEntry = null;
       if (restoreScroll) {
         // restore after layout paints
         requestAnimationFrame(() => {
@@ -1036,17 +1044,47 @@
     });
 
     let searchTimeout;
+    let scrollBeforeSearch = 0; // scroll position before starting a search from feed
+    let detailBeforeSearch = null; // entry that was open when search started from detail
     searchEl.addEventListener('input', () => {
       clearTimeout(searchTimeout);
       searchTimeout = setTimeout(() => {
-        currentFilter = searchEl.value.trim();
-        // If currently on a detail page, return to feed first so search is visible
-        if (detailView.classList.contains('active')) {
-          closeDetail(false);
-          feedScrollY = 0;
+        const q = searchEl.value.trim();
+        const wasOnDetail = detailView.classList.contains('active');
+        const hadFilter = !!currentFilter;
+
+        // Save context when starting a search
+        if (q && !hadFilter) {
+          if (wasOnDetail) {
+            detailBeforeSearch = currentDetailEntry || null;
+          } else {
+            scrollBeforeSearch = window.scrollY || window.pageYOffset || 0;
+            detailBeforeSearch = null;
+          }
         }
+
+        currentFilter = q;
+
+        if (wasOnDetail) {
+          closeDetail(false);
+        }
+
         showMore(true);
-        window.scrollTo({ top: 0, behavior: 'smooth' });
+
+        if (!q) {
+          // Cleared search
+          if (detailBeforeSearch) {
+            const entry = detailBeforeSearch;
+            detailBeforeSearch = null;
+            openDetail(entry);
+          } else {
+            requestAnimationFrame(() => {
+              window.scrollTo({ top: scrollBeforeSearch || feedScrollY || 0, behavior: 'auto' });
+            });
+          }
+        } else {
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+        }
       }, 200);
     });
 
